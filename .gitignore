@@ -1,0 +1,15 @@
+# 构建产物
+pi-isolate
+pi-isolate.exe
+*.exe
+
+# 测试 / 临时
+_test/
+*.log
+
+# 本地配置（可能含本机路径）
+pi-isolate.json
+
+# 编辑器
+.vscode/
+.idea/
