@@ -9,6 +9,18 @@ import (
 
 var colorEnabled = true
 
+// ANSI 控制序列（只在 vtOK 时使用）。
+const (
+	ansiClearLine      = "\x1b[2K"
+	ansiClearToEnd     = "\x1b[J"
+	ansiClearScreen    = "\x1b[2J"
+	ansiHome           = "\x1b[H"
+	ansiHideCursor     = "\x1b[?25l"
+	ansiShowCursor     = "\x1b[?25h"
+	ansiEnterAltScreen = "\x1b[?1049h"
+	ansiLeaveAltScreen = "\x1b[?1049l"
+)
+
 // paint 给文本套 ANSI 颜色；未启用时原样返回。
 func paint(code, s string) string {
 	if !colorEnabled {
@@ -17,12 +29,13 @@ func paint(code, s string) string {
 	return "\x1b[" + code + "m" + s + "\x1b[0m"
 }
 
-func bold(s string) string   { return paint("1", s) }
-func dim(s string) string    { return paint("2", s) }
-func cyan(s string) string   { return paint("36", s) }
-func green(s string) string  { return paint("32", s) }
-func yellow(s string) string { return paint("33", s) }
-func red(s string) string    { return paint("31", s) }
+func bold(s string) string    { return paint("1", s) }
+func dim(s string) string     { return paint("2", s) }
+func cyan(s string) string    { return paint("36", s) }
+func green(s string) string   { return paint("32", s) }
+func yellow(s string) string  { return paint("33", s) }
+func red(s string) string     { return paint("31", s) }
+func inverse(s string) string { return paint("7", s) }
 
 // newLogger 返回一个输出函数。
 // 交互菜单占着屏幕时（键控模式）把日志写进文件，避免和菜单互相刷屏；

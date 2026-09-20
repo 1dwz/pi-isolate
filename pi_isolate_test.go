@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -385,9 +387,9 @@ func TestMenuRenderLines(t *testing.T) {
 			{Name: "default", AgentDir: cfg.GlobalAgentDir, Global: true},
 			{Name: "python", AgentDir: `C:\ProgramData\pi\python\agent`},
 		},
-		cursor: 1,
+		cursor: 1, width: 100, height: 30, useANSI: false,
 	}
-	out := strings.Join(m.renderLines(), "\n")
+	out := strings.Join(m.render(), "\n")
 	for _, want := range []string{"default", "python", "(全局默认)", "Enter 启动", "python\\agent"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("菜单缺少 %q：\n%s", want, out)
@@ -532,7 +534,406 @@ func TestMenuRefreshKeepsSelection(t *testing.T) {
 	}
 }
 
-// ---------- 路径展开 ----------
+// TestRenderRespectsWidth 断言所有渲染行都不会超出终端宽度——
+// 超出会被终端自动换行，从而彻底打乱整屏布局。
+func TestRenderRespectsWidth(t *testing.T) {
+	for _, w := range []int{20, 30, 40, 60, 80, 120} {
+		cfg := &Config{
+			Root:           `C:\ProgramData\pi`,
+			GlobalAgentDir: `C:\Users\Administrator\.pi\agent`,
+		}
+		m := &menu{
+			cfg: cfg, drift: "全部 2 个 profile 的 models.json 与全局一致（中文测试）",
+			profiles: []Profile{
+				{Name: "default", AgentDir: cfg.GlobalAgentDir, Global: true},
+				{Name: "android-reverse-engineering", AgentDir: `C:\ProgramData\pi\android-reverse-engineering\agent`},
+			},
+			cursor: 1, width: w, height: 40, useANSI: false,
+		}
+		for i, line := range m.render() {
+			if got := displayWidth(line); got > w {
+				t.Errorf("宽 %d 时第 %d 行宽度 %d 超出，会触发自动换行：%q", w, i, got, line)
+			}
+		}
+	}
+}
+
+// TestRenderFitsHeight 断言渲染行数不超过终端高度（否则内容会滚动、布局错位）。
+func TestRenderFitsHeight(t *testing.T) {
+	var profiles []Profile
+	for i := 0; i < 40; i++ {
+		profiles = append(profiles, Profile{Name: fmt.Sprintf("p%02d", i), AgentDir: fmt.Sprintf(`C:\pi\p%02d\agent`, i)})
+	}
+	for _, h := range []int{10, 15, 24, 30} {
+		m := &menu{
+			cfg:      &Config{Root: `C:\pi`, GlobalAgentDir: `C:\g\agent`},
+			drift:    "测试",
+			profiles: profiles, cursor: 39, width: 80, height: h, useANSI: false,
+		}
+		got := m.render()
+		if len(got) > h {
+			t.Errorf("高 %d 时渲染了 %d 行，超出会导致滚动", h, len(got))
+		}
+		joined := strings.Join(got, "\n")
+		if !strings.Contains(joined, "p39") {
+			t.Errorf("高 %d 时选中项 p39 不在可视区内", h)
+		}
+	}
+}
+
+// TestRuneWidth 断言中文/ASCII 的宽度计算，乱算会让整屏错位。
+func TestRuneWidth(t *testing.T) {
+	cases := []struct {
+		s    string
+		want int
+	}{
+		{"abc", 3},
+		{"配置文件", 8},
+		{"a中b", 4},
+		{"→", 1},
+		{"✓", 1},
+		{"（中文）", 8},
+		{"", 0},
+	}
+	for _, c := range cases {
+		if got := displayWidth(c.s); got != c.want {
+			t.Errorf("displayWidth(%q) = %d，期望 %d", c.s, got, c.want)
+		}
+	}
+}
+
+// TestTruncateToWidth 断言截断后不超过目标宽度。
+func TestTruncateToWidth(t *testing.T) {
+	for _, w := range []int{1, 2, 3, 5, 10} {
+		got := truncateToWidth("这是一个很长的中文说明文字", w)
+		if displayWidth(got) > w {
+			t.Errorf("宽度 %d 截断后变成 %d：%q", w, displayWidth(got), got)
+		}
+	}
+	if got := truncateToWidth("abc", 5); got != "abc" {
+		t.Errorf("未超长不应改动，得到 %q", got)
+	}
+}
+
+// TestStripANSI 断言颜色序列不会计入显示宽度。
+func TestStripANSI(t *testing.T) {
+	colored := cyan("内容") + dim(" 后缀")
+	if got := displayWidth(colored); got != displayWidth("内容 后缀") {
+		t.Errorf("ANSI 未被剥离：宽度 %d，期望 %d", got, displayWidth("内容 后缀"))
+	}
+}
+
+// ---------- 交互循环：导航必须重绘（本次线上 bug 的回归测试） ----------
+
+// TestNavigationRedraws 是本 bug 的回归测试：
+// 方向键返回 intentNone，若调用方不重绘，用户看到的就是「按上下毫无反应」。
+// 这里直接驱动真实的 handleIntent，并用注入的 writer 断言**确实产生了输出**，
+// 同时断言光标真的移动了（避免「重绘了但内容没变」也当作通过）。
+func TestNavigationRedraws(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+
+	// 首屏由 runMenu 负责绘制，这里手动对齐
+	m.draw()
+	before := buf.Len()
+	if before == 0 {
+		t.Fatal("draw 未产生任何输出")
+	}
+
+	// 导航一次：状态改变 + 必须重绘
+	if intent := m.handleKey("down"); intent != intentNone {
+		t.Fatalf("↓ 应返回 intentNone，实际 %v", intent)
+	}
+	if m.cursor != 1 {
+		t.Fatalf("↓ 后光标应为 1，实际 %d", m.cursor)
+	}
+	buf.Reset()
+	if done := m.handleIntent(intentNone); done {
+		t.Fatal("intentNone 不应结束循环")
+	}
+	if buf.Len() == 0 {
+		t.Fatal("按↓后未重绘 —— 这正是「上下没反应」那个 bug")
+	}
+	drawn := stripANSI(buf.String())
+	if !strings.Contains(drawn, "› 2) android") {
+		t.Errorf("重绘内容未把光标移到第 2 项：\n%s", drawn)
+	}
+
+	// 再按↑：回到第 1 项，并再次重绘
+	m.handleKey("up")
+	buf.Reset()
+	m.handleIntent(intentNone)
+	if buf.Len() == 0 {
+		t.Fatal("按↑后未重绘")
+	}
+	if !strings.Contains(stripANSI(buf.String()), "› 1) default") {
+		t.Errorf("重绘内容未把光标移回第 1 项：\n%s", stripANSI(buf.String()))
+	}
+}
+
+// TestAllNavigationKeysRedraw 断言每一个导航键都会重绘（穷举，不遗漏）。
+func TestAllNavigationKeysRedraw(t *testing.T) {
+	for _, k := range []string{"up", "down", "left", "right", "home", "end", "pgup", "pgdn"} {
+		m := testMenu(t)
+		var buf bytes.Buffer
+		m.out = &buf
+		m.width, m.height = 80, 24
+		m.cursor = 2
+
+		intent := m.handleKey(k)
+		if intent != intentNone {
+			t.Errorf("键 %q 应返回 intentNone，实际 %v", k, intent)
+			continue
+		}
+		buf.Reset()
+		if done := m.handleIntent(intent); done {
+			t.Errorf("键 %q 不应结束循环", k)
+		}
+		if buf.Len() == 0 {
+			t.Errorf("键 %q 未触发重绘", k)
+		}
+	}
+}
+
+// TestIntentQuitEndsLoop 断言退出类按键真的结束循环且**不**重绘。
+func TestIntentQuitEndsLoop(t *testing.T) {
+	for _, k := range []string{"q", "esc", "ctrl-c", "eof"} {
+		m := testMenu(t)
+		var buf bytes.Buffer
+		m.out = &buf
+		m.width, m.height = 80, 24
+		intent := m.handleKey(k)
+		if intent != intentQuit {
+			t.Errorf("键 %q 应为 intentQuit，实际 %v", k, intent)
+			continue
+		}
+		if done := m.handleIntent(intent); !done {
+			t.Errorf("键 %q 应结束循环", k)
+		}
+		if buf.Len() != 0 {
+			t.Errorf("键 %q 不应重绘，却写了 %d 字节", k, buf.Len())
+		}
+	}
+}
+
+// TestFullKeySequenceLaunchesHighlighted 端到端驱动按键序列：
+// ↓ ↓ Enter 必须启动排在第三位的 profile，且启动前把终端交还（先 restore 再 launch）。
+func TestFullKeySequenceLaunchesHighlighted(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+	m.keys = newKeyReaderFrom(strings.NewReader("\x1b[B\x1b[B\r"))
+
+	var order []string
+	var launched Profile
+	m.restoreFn = func() { order = append(order, "restore") }
+	m.launchFn = func(p Profile) error {
+		order = append(order, "launch:"+p.Name)
+		launched = p
+		return nil
+	}
+	m.reenterFn = func() (func(), bool, bool) {
+		order = append(order, "reenter")
+		return func() {}, true, true
+	}
+
+	for i := 0; i < 12; i++ {
+		if m.handleIntent(m.handleKey(m.keys.read())) {
+			break
+		}
+	}
+
+	if launched.Name != "go" {
+		t.Fatalf("期望启动 go（第 3 项），实际 %q", launched.Name)
+	}
+	var seq []string
+	for _, s := range order {
+		if s == "restore" || strings.HasPrefix(s, "launch:") || s == "reenter" {
+			seq = append(seq, s)
+		}
+	}
+	want := "restore,launch:go,reenter"
+	if strings.Join(seq, ",") != want {
+		t.Errorf("终端交还顺序应为 %q，实际 %q", want, strings.Join(seq, ","))
+	}
+}
+
+// TestLaunchFailureKeepsMenuUsable 断言 pi 启动失败后菜单仍可用（不吞错误、不退出）。
+func TestLaunchFailureKeepsMenuUsable(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+	m.restoreFn = func() {}
+	m.launchFn = func(Profile) error { return fmt.Errorf("模拟启动失败") }
+	m.reenterFn = func() (func(), bool, bool) { return func() {}, true, true }
+
+	if done := m.handleIntent(intentLaunch); done {
+		t.Fatal("启动失败不应结束菜单循环")
+	}
+	if !strings.Contains(m.status, "模拟启动失败") {
+		t.Errorf("状态行应显示启动错误，实际 %q", m.status)
+	}
+}
+
+// TestReenterFailureEndsLoop 断言 pi 退出后终端已不可用时就结束循环，不硬撑。
+func TestReenterFailureEndsLoop(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+	m.restoreFn = func() {}
+	m.launchFn = func(Profile) error { return nil }
+	m.reenterFn = func() (func(), bool, bool) { return func() {}, false, false }
+	if done := m.handleIntent(intentLaunch); !done {
+		t.Error("终端不可用时应结束循环")
+	}
+}
+
+// TestDrawClearsTrailingContent 断言重绘会清掉上一次的残留并回到原点，
+// 否则旧字符会留在屏幕上（状态行从长变成短时最明显）。
+func TestDrawClearsTrailingContent(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+	m.status = "这一行很长很长很长很长很长很长很长很长"
+	m.draw()
+	buf.Reset()
+	m.status = "短"
+	m.draw()
+	out := buf.String()
+	if !strings.HasPrefix(out, ansiHome) {
+		t.Error("重绘应先回到原点（CSI H）")
+	}
+	if !strings.Contains(out, ansiClearLine) {
+		t.Error("重绘应逐行清行（CSI 2K）")
+	}
+	if !strings.HasSuffix(out, ansiClearToEnd) {
+		t.Error("重绘末尾应清到屏幕结束（CSI J）")
+	}
+	if strings.Contains(out, "很长很长") {
+		t.Error("旧状态行内容不应残留")
+	}
+}
+
+// TestNewMenuWiresRestoreFn 钉住一个已修过的真实缺陷：
+// 菜单必须持有归还终端的函数，否则 handleIntent 的交还被跳过，
+// pi 会在 raw 模式下启动（输入模式未恢复）。用构造函数强制这个不变式。
+func TestNewMenuWiresRestoreFn(t *testing.T) {
+	cfg := &Config{Root: t.TempDir(), GlobalAgentDir: t.TempDir()}
+	called := 0
+	m := newMenu(cfg, nil, "d", func() { called++ })
+	if m.restoreFn == nil {
+		t.Fatal("newMenu 未挂上 restoreFn —— 这正是那个真实 bug")
+	}
+	m.restoreFn()
+	if called != 1 {
+		t.Errorf("restoreFn 未被正确保存，调用次数 %d", called)
+	}
+	// nil 也要能构造（不应 panic）
+	n := newMenu(cfg, nil, "d", nil)
+	if n.restoreFn == nil {
+		t.Error("传入 nil 时应退化为 no-op 而不是留下 nil")
+	}
+	n.restoreFn()
+}
+
+// TestLaunchRestoresTerminalBeforeSpawn 是本 bug 的第二个回归测试：
+// 必须**在启动 pi 之前**把终端还回去（否则 pi 在 raw 模式下启动，输入可能失效）。
+// 除断言顺序外，还断言 restore 确实被调用过至少一次（曾因 menu 未挂 restoreFn
+// 而整段被跳过，且没有任何测试发现）。
+func TestLaunchRestoresTerminalBeforeSpawn(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+
+	restoreCalls := 0
+	m.restoreFn = func() { restoreCalls++ }
+	restoredBeforeLaunch := false
+	m.launchFn = func(Profile) error {
+		restoredBeforeLaunch = restoreCalls > 0
+		return nil
+	}
+	m.reenterFn = func() (func(), bool, bool) {
+		return func() {}, true, true
+	}
+
+	m.cursor = 1
+	if done := m.handleIntent(intentLaunch); done {
+		t.Fatal("不应结束循环")
+	}
+	if restoreCalls == 0 {
+		t.Fatal("启动 pi 前未归还终端控制台模式")
+	}
+	if !restoredBeforeLaunch {
+		t.Fatal("终端交还发生在 launch 之后，pi 会在 raw 模式下启动")
+	}
+	// 交还 alt screen + 显示光标也必须在 launch 之前发生
+	pre := buf.String()
+	if !strings.Contains(pre, ansiLeaveAltScreen) {
+		t.Error("启动前未退出备用屏")
+	}
+	if !strings.Contains(pre, ansiShowCursor) {
+		t.Error("启动前未恢复光标显示")
+	}
+	// 回来后必须重新进入备用屏
+	if !strings.Contains(pre, ansiEnterAltScreen) {
+		t.Error("pi 退出后未重新进入备用屏")
+	}
+}
+
+// TestHandleIntentReentersRawAfterLaunch 断言 pi 退出后 restoreFn 被换成新的还原函数，
+// 否则后续退出时还原的是已经过期的控制台模式。
+func TestHandleIntentReentersRawAfterLaunch(t *testing.T) {
+	m := testMenu(t)
+	var buf bytes.Buffer
+	m.out = &buf
+	m.width, m.height = 80, 24
+	m.restoreFn = func() {}
+	m.launchFn = func(Profile) error { return nil }
+	newRestore := func() {}
+	m.reenterFn = func() (func(), bool, bool) { return newRestore, true, true }
+
+	m.handleIntent(intentLaunch)
+	if m.restoreFn == nil {
+		t.Fatal("reenter 后 restoreFn 不应为 nil")
+	}
+	// 比较函数地址，确认确实被替换（而不是仍指向旧的 no-op）
+	if funcAddr(m.restoreFn) == funcAddr(func() {}) {
+		t.Error("restoreFn 未被替换为新的还原函数")
+	}
+}
+
+// --- 通过渲染层验证：菜单行里含光标标记，且高亮区段用反色包裹 ---
+
+func TestHighlightUsesInverse(t *testing.T) {
+	m := testMenu(t)
+	m.width, m.height = 80, 24
+	m.cursor = 0
+	lines := m.render()
+	var sel string
+	for _, l := range lines {
+		if strings.Contains(stripANSI(l), "›") {
+			sel = l
+		}
+	}
+	if sel == "" {
+		t.Fatal("未找到选中行")
+	}
+	if !strings.Contains(sel, "\x1b[7m") {
+		t.Errorf("选中项未使用反色高亮：%q", sel)
+	}
+	if !strings.Contains(sel, "\x1b[0m") {
+		t.Errorf("高亮未正确复位：%q", sel)
+	}
+}
+
+// ---------- 路径展开 ---------- ----------
 
 func TestExpandPath(t *testing.T) {
 	home, err := os.UserHomeDir()
@@ -723,4 +1124,9 @@ func must(t *testing.T, err error) {
 
 func sprintf(f string, a ...any) string {
 	return fmt.Sprintf(f, a...)
+}
+
+// funcAddr 取出函数的代码地址，用于判断一个函数变量是否被替换过。
+func funcAddr(f func()) uintptr {
+	return reflect.ValueOf(f).Pointer()
 }

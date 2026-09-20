@@ -64,8 +64,40 @@ pi-isolate new rust                   # 新建 rust 配置
 pi-isolate sync --check               # 检查是否有配置落后于全局
 ```
 
-交互菜单按键：`Enter` 启动、`↑↓` 选择、`n` 新建、`s` 同步全局配置、`r` 刷新、`q`/`Esc` 退出。
-启动 pi 前会把终端交还给 pi（退出 raw 模式），pi 退出后自动回到菜单。
+### 交互菜单
+
+```
+π 配置隔离启动器  1.0.0
+profile 根目录    C:\ProgramData\pi
+全局 models 来源 C:\Users\Administrator\.pi\agent
+同步状态         全部 3 个 profile 的 models.json 与全局一致
+
+› 1) default  (全局默认)
+     → C:\Users\Administrator\.pi\agent
+  2) python
+  3) android
+
+↑↓ 选择   Enter 启动   n 新建   s 同步全局配置   r 刷新   q 退出
+```
+
+| 键 | 作用 |
+|---|---|
+| `↑` `↓` | 移动高亮 |
+| `Home` `End` `PgUp` `PgDn` | 跳到首/尾项 |
+| `Enter` | 用高亮配置启动 pi |
+| `n` | 新建 profile（提示输入名称） |
+| `s` | 同步全局配置到所有 profile |
+| `r` | 重新扫描目录 |
+| `q` / `Esc` / `Ctrl+C` | 退出 |
+
+TUI 细节：
+
+- 使用**备用屏缓冲**（`CSI ?1049h`），不污染你原来的 shell 回滚历史，退出即恢复。
+- **整屏重绘**（光标归位 + 逐行清行），不做「回退 N 行」的增量刷新——那样一旦滚动就会错位。
+- 所有行按终端宽度裁剪，中文按**双列**计算宽度，避免自动换行打乱布局；列表长时自动滚动视口，保证高亮项可见。
+- 同时兼容两种按键交付格式：开启 VT 输入时的 `\x1b[A` 序列，以及未开启时 Windows 的扩展扫描码（`0x00/0xE0` + 扫描码）——后者是 `WriteConsoleInput` 实测确认的格式。
+- **启动 pi 前会把终端控制台模式还原**（并退出备用屏），否则 pi 自己的 TUI 会因仍处于 raw 模式而收不到输入；pi 退出后重新接管。
+- 环境不支持 raw 模式 / ANSI 时，自动退化为逐行输入的菜单（输入序号或名称）。
 
 ## 同步范围
 
@@ -118,8 +150,8 @@ Remove-Item Env:PI_CODING_AGENT_DIR         # 切回全局
 | `profile.go` | profile 发现（扫描根目录）、命名校验、内置全局项 |
 | `sync.go` | 同步与漂移检测、最小 settings 生成、原子写入 |
 | `launch.go` | 环境注入与 pi 子进程启动 |
-| `menu.go` | 交互菜单（raw 模式逐键读取 + 降级逐行菜单） |
-| `console_windows.go` | 控制台模式切换（`GetConsoleMode`/`SetConsoleMode`） |
+| `menu.go` | 交互菜单：按键解析（VT 序列 + Windows 扫描码）、整屏重绘、宽度感知裁剪、交互循环 |
+| `console_windows.go` | 控制台模式切换（`GetConsoleMode`/`SetConsoleMode`）与可见窗口尺寸 |
 
 几处刻意的设计：
 
@@ -133,21 +165,28 @@ Remove-Item Env:PI_CODING_AGENT_DIR         # 切回全局
 ## 测试
 
 ```powershell
-go test ./...        # 29 个用例
+go test ./...        # 45 个用例
 ```
 
-覆盖：profile 命名校验、发现与排序、按键序列解析、启动环境注入（含全局项清除回归）、
+覆盖：profile 命名校验、发现与排序、按键序列解析（VT 与扫描码两种格式）、启动环境注入（含全局项清除回归）、
 同步范围契约（只同步 models.json）、`--check` 只读、最小 settings 契约（不含 packages）、
-菜单决策（导航边界 / 意图映射 / 高亮项启动）、控制台降级（非控制台必须降级、真实控制台必须认得）。
+菜单决策（导航边界 / 意图映射 / 高亮项启动）、**导航后必须重绘**、**启动前必须归还终端**、
+渲染行不超宽/不超高、中文宽度计算、ANSI 剥离、控制台降级（非控制台必须降级、真实控制台必须认得）。
 
 测试有效性用**变异测试**验证过（把实现改回错误写法，套件必须变红）：
 
 | 变异 | 被抓住的用例 |
 |---|---|
 | 启动环境不再注入 `PI_CODING_AGENT_DIR` | `TestBuildLaunchEnvIsolated` |
+| 导航后不重绘（真实的「上下没反应」缺陷） | `TestNavigationRedraws`、`TestAllNavigationKeysRedraw` |
+| 菜单未持有终端归还函数（pi 在 raw 模式下启动） | `TestNewMenuWiresRestoreFn`、`TestLaunchRestoresTerminalBeforeSpawn` |
 | 同步范围擅自扩大到 `settings.json` | `TestSyncOnlyModelsByDefault`、`TestNewProfileLayout` |
 | `--check` 也写盘 | `TestSyncCheckDoesNotWrite` |
 | 覆盖已存在的 `settings.json` | `TestMaybeSyncRepairsMissingSettings`、`TestEnsureSkeletonKeepsExistingSettings` |
+
+交互链路另有**真机端到端验证**（不是单元测试）：用 `CreateProcess(CREATE_NEW_CONSOLE)` 拉起真实 `pi-isolate.exe`，
+`AttachConsole` 后用 `WriteConsoleInput` 注入方向键/回车，再用 `ReadConsoleOutputCharacterW` 读回屏幕缓冲区，
+断言高亮行确实随按键移动、Enter 用正确配置启动、pi 退出后回到菜单且屏幕仍含状态行。
 
 ## 已知限制
 
